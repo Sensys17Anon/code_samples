@@ -1,0 +1,195 @@
+local model Vibration(size : int32):
+    properties:
+        durable = False
+        records = size
+
+    schema:
+        time : timestamp
+        vibration : double
+
+streaming model PPhase(size : int32):
+    properties:
+        reliable = True
+        durable = False
+        records = size
+        flow = VibrationSensorNode -> CoordinatorNode
+    schema:
+        time : timestamp
+        prelim_pphase : int32
+        signal_sparsity : int32
+
+streaming model CompressedSample(size : int32):
+    properties:
+        reliable = True
+        durable = False
+        records = size
+        flow = VibrationSensorNode -> CoordinatorNode
+    schema:
+        sample : byte[]
+
+replicated model TransmitCS():
+    properties:
+        reliable = False
+        durable = False
+        records = 1
+    schema:
+        tx_cs : bool
+
+interface VolcanoAlgorithm():
+    use:
+        phase_model = PPhase
+    implementation:
+        c = "rlib/c/libvolcano.stg"
+    
+    def select(phase_model : PPhase) : Endpoint
+    def compute_pphase(vibrations : double[]) : int32
+    def sparsity(vibrations : double[]) : int32
+    def compressing_sampling(vibrations : double[]) : byte[]
+
+interface VibrationSensor():
+    implementation:
+        c = "rlib/nrf52/buttons.stg"
+
+    event pressed(button_id : int32)
+
+
+interface Timer():
+    implementation:
+        c = "rlib/nrf52/app_timer_sys.stg"
+        java = "rlib/java/timer.stg"
+
+    def start_one_shot(time : int32)
+    def cancel()
+    def start_periodic(time : int32)
+    event fired()
+
+interface Clock():
+    implementation:
+        c = "rlib/nrf52/clock.stg"
+
+    def getNow() : timestamp
+
+controller Coordinator(phase_model : PPhase, cs_model : CompressedSample,
+                       tx_cs : TransmitCS, algo : VolcanoAlgorithm):
+    event phase_model.full():
+        dest = algo.select(phase_model)
+        rec = tx_cs.create()
+        rec.tx_cs = True
+        tx_cs.save(rec, dest)
+
+
+controller Node(vibration_model : Vibration,
+                phase_model : PPhase,
+                cs_model : CompressedSample,
+                tx_cs : TransmitCS,
+                vib_src : VibrationSensor,
+                p_timer : Timer,
+                p_clock : Clock,
+                algo : VolcanoAlgorithm):
+    back_off_time = 5000
+    vib_threshold = 1.2
+    time_threshold = 1200
+    last = 0
+ 
+    event system.started():
+        last = (int32)p_clock.getNow()
+
+    event vib_src.pressed(val : int32):
+        now = p_clock.getNow()
+        t_diff = (int32)now - last
+        last = (int32)now
+        if t_diff > time_threshold:
+            vibration_model.clear()
+        else:
+            if vib_threshold < val:
+                rec = vibration_model.create()
+                rec.time = now
+                rec.vibration = val+0.123
+                vibration_model.save(rec)
+
+    event vibration_model.full():
+        rec = phase_model.create()
+        rec.time = p_clock.getNow()
+        vibrations : double[50]
+        i = 0
+        for v in vibration_model:
+            vibrations[i] = v.vibration
+        rec.prelim_pphase = algo.compute_pphase(vibrations)
+        rec.signal_sparsity = algo.sparsity(vibrations)
+        phase_model.save(rec)
+
+    event vibration_model.save_done():
+        p_timer.start_periodic(back_off_time)
+
+    event p_timer.fired():
+        rec = tx_cs.first()
+        if not rec.tx_cs:
+            vibration_model.clear()
+            phase_model.clear()
+
+    event tx_cs.arrived():
+        rec = tx_cs.first()
+        if rec.tx_cs:
+            rec_cs = cs_model.create()
+            vibrations : double[50]
+            i = 0
+            for v in vibration_model:
+                vibrations[i] = v.vibration
+            rec_cs.sample = algo.compressing_sampling(vibrations)
+            cs_model.save(rec_cs)
+            rec.tx_cs = False
+            tx_cs.save(rec, self.endpoint)
+        else:
+            vibration_model.clear()
+            phase_model.clear()
+
+    event cs_model.save_done():
+        cs_model.clear()
+
+
+space VibrationSensorNode:
+    platform:
+        language = CLang
+        system = Nrf52.v1
+
+    models:
+        vibration = Vibration(size=50)
+        pPhase = PPhase(size=1)
+        cs = CompressedSample(size=10)
+        tx_cs = TransmitCS()
+        
+    interfaces:
+        timer = Timer()
+        clock = Clock()
+        sensor = VibrationSensor()
+        algorithm = VolcanoAlgorithm()
+
+    controllers:
+        node = Node(vibration_model = models.vibration,
+                    phase_model = models.pPhase,
+                    cs_model = models.cs,
+                    tx_cs = models.tx_cs,
+                    vib_src = interfaces.sensor,
+                    p_timer = interfaces.timer,
+                    p_clock = interfaces.clock,
+                    algo = interfaces.algorithm)
+
+
+space CoordinatorNode:
+    platform:
+        language = CLang
+        system = Nrf52.v1
+
+    models:
+        pPhase = PPhase(size=10)
+        cs = CompressedSample(size=10)
+        tx_cs = TransmitCS()
+
+    interfaces:
+        algorithm = VolcanoAlgorithm()
+
+    controllers:
+        node = Coordinator(phase_model = models.pPhase,
+                           cs_model = models.cs,
+                           tx_cs = models.tx_cs,
+                           algo = interfaces.algorithm)
