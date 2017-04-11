@@ -1,0 +1,90 @@
+interface Clock():
+    implementation:
+        c = "rlib/nrf52/clock.stg"
+        java = "rlib/java/clock.stg"
+
+    def getNow() : int32
+
+
+streaming model DataMule(size : int32):
+    properties:
+        durable = False
+        reliable = False
+        records = size
+        flow = EmbeddedSpace -> GatewaySpace
+
+    schema:
+        value : int32
+        fill : int32[58]
+
+
+
+controller EmbeddedController(data: DataMule, clock : Clock):
+    counter : int32 = 0
+
+    event system.started():
+        rec = data.create()
+        rec.value = counter
+        data.save(rec)
+
+    event data.departed():
+        delete(self.record)
+        counter +=1
+        rec = data.create()
+        rec.value = counter
+        data.save(rec)
+
+    event data.full():
+        system.print("model full")
+
+
+
+
+controller GatewayController(data: DataMule, clock: Clock):
+    t_first : int32 = 0
+    t_delta : int32 = 0
+    first : bool = True
+
+    event data.arrived():
+        if first:
+            t_first = clock.getNow()
+            first = False
+            system.print("TIME: now: " + (str) t_first)
+        counter = self.record.value
+        system.print("data arrived" + (str) counter)
+
+    event data.full():
+        t_delta = clock.getNow() - t_first
+        system.print("TIME: RX 100 pkts: " + (str)t_delta)
+
+
+
+
+space EmbeddedSpace:
+    platform:
+        language = CLang
+        system = Nrf52.v1
+
+    models:
+        data = DataMule(size=10)
+
+    interfaces:
+        clock = Clock()
+
+    controllers:
+        ectrl = EmbeddedController(data = models.data, clock = interfaces.clock)
+
+space GatewaySpace:
+    platform:
+        language = JLang
+        system = Android.v19
+        #system = J2SE.v18
+        
+    models:
+        data = DataMule(size=100)
+
+    interfaces:
+            clock = Clock()
+        
+    controllers:
+        gctrl = GatewayController(data = models.data, clock = interfaces.clock)
